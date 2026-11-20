@@ -9,9 +9,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 
 from .kube import KubeClient, KubeConfig, KubeError
+from .diagnose import DiagnoseService
 from .models import (
     CatchupResponse,
     HealthResponse,
+    LastFailureResponse,
     RecordResponse,
     ScheduleResponse,
 )
@@ -130,6 +132,26 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=e.status_code, detail=e.message)
         except CronError as e:
             raise HTTPException(status_code=422, detail=f"调度计算失败: {e}")
+
+    @app.get(
+        "/namespaces/{namespace}/jobs/{job_name}/last-failure",
+        response_model=LastFailureResponse,
+        tags=["诊断"],
+        summary="查补跑 Job 最近一次可见的非零退出（只读，附最后 80 行日志）",
+    )
+    async def last_failure(
+        namespace: str,
+        job_name: str,
+        uid: str = Query(
+            ..., description="Job 的 metadata.uid，用于核对身份防止查到同名重建的 Job"
+        ),
+    ) -> Any:
+        # DiagnoseService 无状态，按请求构造即可
+        diagnose = DiagnoseService(app.state.kube)
+        try:
+            return await diagnose.last_failure(namespace, job_name, uid)
+        except ServiceError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.message)
 
     @app.get(
         "/records",

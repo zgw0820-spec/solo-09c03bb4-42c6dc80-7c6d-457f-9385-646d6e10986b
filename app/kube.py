@@ -1,10 +1,11 @@
-"""极简 Kubernetes API 客户端（batch/v1），基于 httpx，直连 REST。
+"""极简 Kubernetes API 客户端（batch/v1 + core/v1 Pod 读取），基于 httpx，直连 REST。
 
 面向 Kubernetes 1.32+：
 - CronJob 使用 batch/v1（GA），字段 spec.timeZone / spec.suspend。
 - Job 标签 batch.kubernetes.io/cronjob-name、
   注解 batch.kubernetes.io/cronjob-uid 与 .../job-name（KEP-3335 新格式）。
 - 同时兼容旧格式 controller-uid 注解与 job-name 注解。
+- core/v1 仅用于只读诊断：列/读 Pod、取容器日志。
 """
 from __future__ import annotations
 
@@ -48,6 +49,8 @@ class KubeConfig:
     create_timeout: float = 5.0
     verify_timeout: float = 10.0
     extra_headers: dict[str, str] | None = None
+    # 仅加到 Pod/日志请求上的头（本地模拟端诊断故障注入用）
+    pod_extra_headers: dict[str, str] | None = None
 
     @classmethod
     def from_env(cls) -> "KubeConfig":
@@ -55,6 +58,10 @@ class KubeConfig:
         fault = os.environ.get("KUBE_MOCK_FAULT")
         if fault:
             extra = {"X-Mock-Fault": fault}
+        pod_extra = None
+        pod_fault = os.environ.get("KUBE_MOCK_POD_FAULT")
+        if pod_fault:
+            pod_extra = {"X-Mock-Pod-Fault": pod_fault}
         return cls(
             base_url=os.environ.get("KUBE_API_URL", "http://localhost:8001"),
             token=os.environ.get("KUBE_TOKEN") or None,
@@ -63,6 +70,7 @@ class KubeConfig:
             create_timeout=float(os.environ.get("KUBE_CREATE_TIMEOUT", "5")),
             verify_timeout=float(os.environ.get("KUBE_VERIFY_TIMEOUT", "10")),
             extra_headers=extra,
+            pod_extra_headers=pod_extra,
         )
 
 
@@ -116,16 +124,64 @@ class KubeClient:
             timeout=self.config.verify_timeout,
         )
 
+    # ---------- core/v1：只读诊断用 ----------
+
+    def _pod_headers(self) -> dict[str, str] | None:
+        return dict(self.config.pod_extra_headers) if self.config.pod_extra_headers else None
+
+    async def list_pods(self, namespace: str) -> list[dict[str, Any]]:
+        data = await self._request(
+            "GET",
+            f"/api/v1/namespaces/{namespace}/pods",
+            headers=self._pod_headers(),
+        )
+        return data.get("items", [])
+
+    async def get_pod(self, namespace: str, name: str) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/api/v1/namespaces/{namespace}/pods/{name}",
+            headers=self._pod_headers(),
+        )
+
+    async def get_pod_log(
+        self,
+        namespace: str,
+        pod: str,
+        container: str,
+        tail_lines: int = 80,
+        previous: bool = False,
+    ) -> str:
+        """取容器日志最后 tail_lines 行（text/plain）。
+
+        previous=True 取上一次退出容器的日志（对应 lastState.terminated）。
+        """
+        return await self._request(
+            "GET",
+            f"/api/v1/namespaces/{namespace}/pods/{pod}/log",
+            params={
+                "container": container,
+                "tailLines": str(tail_lines),
+                "previous": "true" if previous else "false",
+            },
+            headers=self._pod_headers(),
+            raw_text=True,
+        )
+
     async def _request(
         self,
         method: str,
         path: str,
         json: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float | None = None,
-    ) -> dict[str, Any]:
+        raw_text: bool = False,
+    ) -> Any:
         try:
             resp = await self._client.request(
-                method, path, json=json, timeout=timeout or self.config.timeout
+                method, path, json=json, params=params, headers=headers,
+                timeout=timeout or self.config.timeout,
             )
         except httpx.TimeoutException as exc:
             raise KubeError(f"Kubernetes API 请求超时: {method} {path}: {exc}") from exc
@@ -144,6 +200,8 @@ class KubeClient:
             raise KubeError(
                 f"Kubernetes API {resp.status_code}: {method} {path} -> {resp.text[:500]}"
             )
+        if raw_text:
+            return resp.text
         if resp.status_code == 204 or not resp.content:
             return {}
         return resp.json()

@@ -27,20 +27,29 @@
    - 补跑台账持久化在 SQLite，**进程重启后**创建到一半的记录自动转为待核实，可通过 `/reverify` 查回；
    - 超过 2 小时补跑期限后，计划与历史 Job/台账仍可查询，只是不能再新建。
 5. **演练支持**：所有接口支持 `at` 查询参数（ISO 8601，可带时区），在 Swagger 上即可指定演练时间。
+6. **失败诊断（只读）**：`GET /namespaces/{ns}/jobs/{job}/last-failure?uid=...`
+   - 核对 Job 名 + UID 后，从它控制的**单容器 Pod** 中按结束时间找最近一次可见的非零退出
+     （容器当前退出与**同一 Pod 的上一次退出** `lastState.terminated` 都算）；
+   - 返回 Pod 名、退出码、结束时间与最后 80 行日志；取日志后**复核 Pod 状态，
+     确认日志仍属于该次退出才附上**；
+   - 取日志途中容器再次重启、Pod 被清理或日志接口报错：保留退出信息，
+     `logs` 置空并在 `logs_reason` 说明原因；
+   - “没有可见失败”（200，`status=no_visible_failure`）与“查不到 Pod 列表”（502）分别提示。
 
 ## 目录结构
 
 ```
 app/
   schedule.py   # cron 解析、时区/DST 计算
-  kube.py       # Kubernetes batch/v1 客户端、Job 匹配与清单构造
+  kube.py       # Kubernetes batch/v1 + core/v1(Pod/日志) 客户端、Job 匹配与清单构造
   store.py      # SQLite 台账 + 同轮并发锁
   service.py    # 补跑编排（校验、创建、超时回查、状态机）
+  diagnose.py   # 只读诊断：最近一次非零退出定位与日志归属复核
   models.py     # Swagger 响应模型
   main.py       # FastAPI 入口
 mock_k8s/
-  server.py     # 本地 Kubernetes API 模拟（含故障注入）
-tests/          # pytest：调度/DST、接口、并发、超时重试、重启恢复
+  server.py     # 本地 Kubernetes API 模拟（含故障注入与诊断演示数据）
+tests/          # pytest：调度/DST、接口、并发、超时重试、重启恢复、失败诊断
 docker-compose.yml
 ```
 
@@ -63,6 +72,20 @@ docker compose up --build
 | `create-timeout` | Job 先落库，再滞留到客户端超时后返回 504 |
 | `create-timeout-lose` | Job 先落库，然后直接断开连接（无任何回包） |
 | `create-conflict-once` | 首次创建返回 409，第二次正常 |
+
+### 诊断故障注入（请求头 `X-Mock-Pod-Fault`，仅作用于 Pod/日志接口）
+
+由巡检服务环境变量 `KUBE_MOCK_POD_FAULT` 注入（compose 默认不启用）。
+
+| 值 | 行为 |
+|---|---|
+| `pods-list-error` | 列 Pod 返回 500（演示“查不到 Pod 列表”） |
+| `log-error` | 日志接口返回 500 |
+| `pod-gone-on-log` | 取日志时 Pod 已被清理（删 Pod 并返回 404） |
+
+另外，种子 Pod `inspection-daily-catchup-flaky-p1` 带注解 `mock.example.com/restart-on-log`，
+对它的当前日志请求会先把容器翻转为“又重启了一次”再返回旧日志，
+用于演示“**取日志途中容器再次重启**”。
 
 ## 不用容器的本地运行方式
 
@@ -94,6 +117,24 @@ curl -X POST "http://localhost:8080/namespaces/default/cronjobs/inspection-ny/re
 curl "http://localhost:8080/records"
 ```
 
+### 失败诊断演示（Swagger 亦可点选）
+
+模拟端预置了三个历史补跑 Job（均属 `inspection-daily`），Job UID 可经
+`curl http://localhost:8001/apis/batch/v1/namespaces/default/jobs/<job名>` 查询。
+
+```bash
+# 情形 1：最近一次失败是某 Pod 的“上一次退出”（lastState.terminated，01:05Z 结束，
+# 晚于另一 Pod 当前退出的 01:03Z），附该次退出的最后 80 行日志
+curl "http://localhost:8080/namespaces/default/jobs/inspection-daily-catchup-202611190100/last-failure?uid=job-1ec091c5-4d02-5c78-b1a5-1568ac722a45"
+
+# 情形 2：取日志途中容器再次重启 —— 退出信息保留，logs 为 null 并说明原因；
+# 紧接着再调一次，上次退出已落入 lastState，复核通过并附上日志
+curl "http://localhost:8080/namespaces/default/jobs/inspection-daily-catchup-flaky/last-failure?uid=job-882b2f51-6075-5749-b5ac-7bb65f4bf2b7"
+
+# 全部成功：没有可见失败
+curl "http://localhost:8080/namespaces/default/jobs/inspection-daily-catchup-202611170100/last-failure?uid=job-183cf4ed-5ba6-574c-828f-b217fa0668ec"
+```
+
 ## 测试
 
 ```bash
@@ -101,12 +142,17 @@ pytest
 ```
 
 覆盖：cron 解析与 DST（纽约/柏林/上海/东京）、已有 Job 直接返回、补建成功、
-暂停/窗口/时区/非每日表达式拦截、5 路并发只建一个、创建超时回查、查不清待核实、重启恢复查回。
+暂停/窗口/时区/非每日表达式拦截、5 路并发只建一个、创建超时回查、查不清待核实、重启恢复查回、
+失败诊断（上一次退出选取、日志归属复核、取日志途中重启/Pod 被清理/日志接口报错、
+没有可见失败与 Pod 列表失败区分、UID 核对）。
 
 ## 已知边界 / 未完成项
 
 - 鉴权仅支持 Bearer Token（`KUBE_TOKEN`），未做 mTLS 与 in-cluster ServiceAccount 自动挂载；
 - 并发锁是单进程内的 asyncio 锁，多副本部署时只有 SQLite 唯一约束兜底
   （多副本需换共享数据库或带 CAS 的外部锁）；
-- 模拟服务只实现了本项目用到的 batch/v1 接口子集，不是完整 apiserver；
+- 模拟服务只实现了本项目用到的 batch/v1 与 core/v1 接口子集，不是完整 apiserver；
+- 诊断接口只覆盖单容器 Pod（多容器 Pod 在响应 `skipped_pods` 中列出）；
+  日志归属复核基于 containerID/退出记录比对，极端情况下（复核通过后瞬间 Pod 被清理）
+  仍可能附上过时日志；
 - 未实现真实集群的集成测试（环境内无 Docker/集群），集成路径以模拟服务验证。

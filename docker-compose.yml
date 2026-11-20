@@ -32,6 +32,8 @@ services:
       CATCHUP_DB: "/data/catchup.db"
       # 故障注入头（测试演练用；置空则关闭）
       KUBE_MOCK_FAULT: "create-timeout"
+      # 诊断故障注入（仅作用于 Pod/日志接口；可选值见 README，默认不启用）
+      # KUBE_MOCK_POD_FAULT: "pods-list-error"
       TZ: "UTC"
     volumes:
       - catchup-data:/data

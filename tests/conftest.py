@@ -28,6 +28,8 @@ async def harness(mock_state, request):
     """每个用例独立的 mock + 应用栈；可通过 marker 注入故障头。"""
     fault_marker = request.node.get_closest_marker("mock_fault")
     fault = fault_marker.args[0] if fault_marker else None
+    pod_fault_marker = request.node.get_closest_marker("mock_pod_fault")
+    pod_fault = pod_fault_marker.args[0] if pod_fault_marker else None
     slow = request.node.get_closest_marker("mock_slow")
     slow_delay = slow.args[0] if slow else 1.5
 
@@ -49,6 +51,7 @@ async def harness(mock_state, request):
         create_timeout=0.5,
         verify_timeout=10,
         extra_headers={"X-Mock-Fault": fault} if fault else None,
+        pod_extra_headers={"X-Mock-Pod-Fault": pod_fault} if pod_fault else None,
     )
     kube = KubeClient(kube_config)
     # 用 ASGI transport 替换内部 httpx client

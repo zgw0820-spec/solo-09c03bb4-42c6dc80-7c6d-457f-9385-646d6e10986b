@@ -65,3 +65,48 @@ class RecordResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     kubernetes_api: str
+
+
+class LastFailureStatus(str, Enum):
+    found = "found"                            # 找到最近一次可见的非零退出
+    no_visible_failure = "no_visible_failure"  # 没有可见的非零退出
+
+
+class TerminationSource(str, Enum):
+    current = "current"    # 容器当前（最近一次）退出：state.terminated
+    previous = "previous"  # 同一 Pod 的上一次退出：lastState.terminated
+
+
+class LogsStatus(str, Enum):
+    attached = "attached"          # 已确认日志属于该次退出并附上
+    unavailable = "unavailable"    # 退出信息保留，但日志拿不到（原因见 logs_reason）
+    not_applicable = "not_applicable"  # 没有可见失败，不涉及日志
+
+
+class LastFailureResponse(BaseModel):
+    """补跑 Job 最近一次可见非零退出的诊断结果（只读）。"""
+
+    status: LastFailureStatus
+    namespace: str
+    job_name: str
+    job_uid: str
+    pod: str | None = Field(None, description="发生退出的 Pod 名")
+    container: str | None = Field(None, description="发生退出的容器名")
+    exit_code: int | None = Field(None, description="非零退出码")
+    finished_at: datetime | None = Field(None, description="该次退出的结束时间（UTC）")
+    termination_source: TerminationSource | None = Field(
+        None, description="current=容器当前退出；previous=同一 Pod 的上一次退出"
+    )
+    restart_count: int | None = Field(None, description="该容器当前累计重启次数")
+    logs: str | None = Field(
+        None, description="该次退出容器的最后 80 行日志；仅确认属于该次退出才附上"
+    )
+    logs_status: LogsStatus
+    logs_reason: str | None = Field(
+        None, description="日志未附上的原因（容器再重启/Pod 被清理/日志接口报错等）"
+    )
+    checked_pods: int = Field(..., description="纳入检查的单容器 Pod 数")
+    skipped_pods: list[str] = Field(
+        default_factory=list, description="跳过的多容器 Pod 名（本接口只诊断单容器 Pod）"
+    )
+    message: str | None = Field(None, description="人类可读提示（如没有可见失败时）")
